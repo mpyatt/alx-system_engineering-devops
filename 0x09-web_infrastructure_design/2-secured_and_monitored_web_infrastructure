@@ -1,0 +1,146 @@
+# High-level request flow (encrypted)
+
+1. User enters **[www.foobar.com](http://www.foobar.com)** → DNS `A` record resolves to the **load balancer public IP**.
+2. Browser connects via **HTTPS (TCP/443)**.
+3. **HAProxy** terminates TLS **(or re-encrypts to backend)** and forwards to **Nginx** on the Web/App server.
+4. **Nginx** serves static files and reverse-proxies dynamic requests to the app process (localhost:3000).
+5. App queries **MySQL** on the DB server (TCP/3306).
+6. Response flows back the same path → user.
+
+## Whiteboard diagram (secured & monitored)
+
+```sh
+                 Internet
+                    |
+           +-----------------+
+           |  Firewall #1    |  (LB tier)
+           |  (LB security)  |
+           +--------+--------+
+                    |
+           [ HAProxy Load Balancer ]  <-- SSL cert for www.foobar.com
+             - TLS termination (optionally TLS re-encrypt to backend)
+             - Health checks, routing, rate limiting
+             - Monitoring agent #1 (logs/metrics)
+                    |
+            (private network)
+                    |
+           +-----------------+
+           |  Firewall #2    |  (Web/App tier)
+           +--------+--------+
+                    |
+          [ Web/App Server ]
+            - Nginx (HTTPS from LB or HTTP if only LB TLS)
+            - App server (e.g., Gunicorn/Uvicorn/Puma/Node)
+            - Monitoring agent #2 (logs/metrics)
+                    |
+            (private network)
+                    |
+           +-----------------+
+           |  Firewall #3    |  (DB tier)
+           +--------+--------+
+                    |
+             [ MySQL Server ]
+              - Primary (writes)
+              - Monitoring agent #3 (logs/metrics)
+```
+
+## Why each additional element is added
+
+* **3 Firewalls (one per tier)**: Enforce least-privilege network access between Internet ↔ LB, LB ↔ Web/App, and Web/App ↔ DB. Limits blast radius and blocks lateral movement.
+* **1 SSL certificate (for [www.foobar.com](http://www.foobar.com))**: Enables **HTTPS** on the LB (and optionally on Nginx too), providing confidentiality, integrity, and authenticity.
+* **3 Monitoring clients (agents)**: One on each server to ship **logs, metrics, and health** to Sumo Logic (or similar). Enables visibility, alerting, and incident response.
+
+## What firewalls are for
+
+A firewall filters traffic by **address, port, and protocol**. Here’s a minimal rule set:
+
+* **Firewall #1 (LB)**
+
+  * Inbound: 443/tcp **from anywhere** (HTTPS), optionally 80/tcp for HTTP→HTTPS redirects
+  * Inbound: SSH **blocked** (or restricted to a bastion IP)
+  * Outbound: 80/443 to Web/App (or 443 if re-encrypting), 53 (DNS), 123 (NTP), 443 to monitoring SaaS
+* **Firewall #2 (Web/App)**
+
+  * Inbound: 80/443 **only from LB private IP(s)**
+  * Inbound: 22/tcp (SSH) from bastion or VPN only
+  * Outbound: 3306 to DB, 443 to monitoring SaaS
+* **Firewall #3 (DB)**
+
+  * Inbound: 3306 **only from Web/App private IP**
+  * Inbound: 22/tcp from bastion or VPN only
+  * Outbound: 443 to monitoring SaaS, backups
+
+## Why serve traffic over HTTPS
+
+* **Confidentiality**: Prevents eavesdropping on credentials, cookies, and PII.
+* **Integrity**: Detects tampering.
+* **Authenticity**: Certificates prove the site is **[www.foobar.com](http://www.foobar.com)**.
+* **Modern browser features** (HSTS, Service Workers) require HTTPS.
+
+## Monitoring: what & how
+
+**What monitoring is used for**
+
+* Detect failures early, observe performance, investigate incidents, and set **alerts** (error spikes, latency, high CPU, DB connections, disk, TLS errors).
+
+**How the tool collects data (Sumo or similar)**
+
+* **Agent (collector)** on each host tails logs and scrapes metrics:
+
+  * LB: HAProxy logs, TLS errors, backend health states
+  * Web/App: Nginx access/error logs, app logs, process metrics
+  * DB: MySQL slow query log, error log, connections, replication (if added)
+* Agents **push** data securely (HTTPS) to the SaaS endpoint at intervals; some metrics (e.g., node\_exporter equivalent) are scraped or read from `/proc`, others are parsed from log files.
+
+**If you want to monitor Web server QPS** (queries per second)
+
+* Option A (log-based):
+
+  1. Ensure Nginx access logs include `$time_iso8601`.
+  2. The agent forwards logs to Sumo.
+  3. Create a Sumo query that counts requests per 1s/10s/1m buckets (e.g., `| parse ... | timeslice 1m | count by _timeslice | ...`).
+  4. Dashboard a **QPS** panel (requests / second) and set **alerts** on thresholds (e.g., sustained > X QPS or sudden spikes).
+* Option B (status endpoint):
+
+  1. Enable **`stub_status`** (Nginx) or **HAProxy stats**.
+  2. The agent scrapes the endpoint, computes QPS from request counters (delta over interval).
+  3. Ship as a metric, chart it, alert on anomalies.
+
+## Load balancer specifics (security-aware)
+
+* **Algorithm**: `roundrobin` (simple rotation across healthy backends; session stickiness optional).
+* **TLS termination** at LB for performance/offload; **optionally re-encrypt** LB→Nginx with TLS to keep data encrypted in transit on the private network.
+* **Health checks**: Mark backends up/down; stop sending traffic to unhealthy nodes.
+
+## Primary–Replica (Master–Slave) MySQL (how it works)
+
+* **Primary**: Accepts **writes** and emits **binary logs**.
+* **Replica(s)**: **Replay** binlogs to stay in sync (usually asynchronous; there can be **replication lag**).
+* **From the app**: Sends **writes** to Primary; may send **reads** to Replicas (read scaling). On failover, a Replica is promoted to Primary and clients re-point writes.
+
+## Issues & trade-offs you should know
+
+**1) SSL termination only at the load balancer**
+
+* **Issue**: Traffic from LB → Web/App is **plaintext** if you don’t re-encrypt. Anyone with access to the internal network could sniff data. Some compliance regimes require **end-to-end TLS**.
+* **Mitigate**: Use **TLS re-encryption** LB→Nginx (or full TLS passthrough with certs on Nginx), and consider **mTLS** internally.
+
+**2) Only one MySQL server can accept writes**
+
+* **Issue**: It’s a **Single Point of Failure** for writes and a **write bottleneck**. Maintenance on the Primary causes downtime unless you have orchestrated failover.
+* **Mitigate**: Add a **Replica** + automated failover (Orchestrator/ProxySQL), or use managed HA (e.g., Multi-AZ). Implement **backups** and regular **restore tests**.
+
+**3) Servers with all the same components (DB + Web + App on each)**
+
+* **Issue**: Blurs responsibilities, increases **blast radius**, makes **scaling** inefficient (every node carries DB overhead), risks **split-brain** if multiple DBs accept writes, and invites **config drift**.
+* **Mitigate**: **Tier separation** (LB / Web-App / DB) with clear scaling and ownership; only DB tier runs database services.
+
+## Concrete hardening checklist (quick hits)
+
+* Enforce **HTTPS only** at the edge, add **HSTS**.
+* Consider **TLS re-encryption** to Nginx; restrict all private subnets with the three firewalls.
+* Lock SSH to **bastion/VPN**; disable password auth; use MFA.
+* Turn on **rate limiting**/DoS controls at HAProxy & Nginx.
+* Ship **HAProxy/Nginx/MySQL logs** + **system metrics** with the 3 agents; add dashboards (QPS, p95 latency, 5xx rate, DB connections, disk).
+* Add **alerts** (LB backend down, surge in 5xx, QPS spike/drop, DB lag, disk > 80%).
+* Plan **DB replicas** + **automated failover**, and **LB redundancy** (second HAProxy + floating IP/anycast/managed LB) to remove SPOFs.
