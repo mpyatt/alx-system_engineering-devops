@@ -1,0 +1,111 @@
+# User journey (request flow)
+
+1. A user types **[www.foobar.com](http://www.foobar.com)** into their browser and hits Enter.
+2. The browser asks DNS for **[www.foobar.com](http://www.foobar.com)**. DNS replies with the server’s public IP: **8.8.8.8**.
+3. The browser opens a TCP connection to **8.8.8.8** on **443 (HTTPS)** (or 80 for HTTP).
+4. **Nginx (web server)** on that machine terminates TLS, serves any static assets, and **reverse-proxies** dynamic requests to the **application server** on `127.0.0.1:3000`.
+5. The **application server** runs your **application code** (the code base) and, when needed, queries **MySQL** on `127.0.0.1:3306`.
+6. The app server returns the response to **Nginx**, which streams it back to the user over HTTPS.
+
+## “Whiteboard” diagram (one server)
+
+```sh
+                     +--------------------+
+User's Browser  ---> |  Internet (TCP/IP) | ---> [ Server: 8.8.8.8 ]
+                     +--------------------+                |
+                                                          |  :80 / :443
+                                                   +--------------+
+                                                   |   Nginx      |  <-- Web server
+                                                   | (TLS +       |
+                                                   |  reverse     |
+                                                   |  proxy +     |
+                                                   |  static)     |
+                                                   +------+-------+
+                                                          |
+                                                          |  http://127.0.0.1:3000
+                                                   +------+-------+
+                                                   | App Server   |  <-- Runs your code
+                                                   | (e.g.,       |      (Gunicorn/uvicorn,
+                                                   |  Gunicorn)   |       Puma, Node, etc.)
+                                                   +------+-------+
+                                                          |
+                                                          |  mysql://127.0.0.1:3306
+                                                   +------+-------+
+                                                   |   MySQL DB   |
+                                                   +--------------+
+
+[ Same machine / single VM ]
+Filesystem holds:
+- /var/www/foobar      (application files / code base)
+- /var/lib/mysql       (database files)
+- /etc/nginx           (Nginx config + TLS certs)
+```
+
+## What each piece is (specifics)
+
+**What is a server?**
+A physical or virtual computer (CPU, RAM, disk, OS like Ubuntu) that runs your software. Here it hosts Nginx, the app server, your code, and MySQL, and it has a public IP (**8.8.8.8**) so clients can reach it.
+
+**Role of the domain name**
+`foobar.com` is a human-readable name. DNS maps **[www.foobar.com](http://www.foobar.com)** → **8.8.8.8**, so users don’t have to remember the IP.
+
+**Type of DNS record for `www` in `www.foobar.com`**
+An **A record** pointing **[www.foobar.com](http://www.foobar.com) → 8.8.8.8** (as required).
+
+**Role of the web server (Nginx)**
+
+* Listens on ports **80/443**
+* Handles **TLS (HTTPS)**, HTTP details (keep-alive, compression, caching)
+* Serves **static files** directly (CSS, JS, images)
+* **Reverse-proxies** dynamic requests to the app server
+
+**Role of the application server**
+
+* Executes your **application code** (routing, controllers, views, APIs)
+* Talks to the database and returns dynamic responses to Nginx
+
+**Role of the database (MySQL)**
+
+* **Persists** structured data (users, posts, orders, etc.)
+* Runs locally on `127.0.0.1:3306`, only reachable by the app
+
+**How the server communicates with the user’s computer**
+Via the **TCP/IP** stack using **HTTP/HTTPS**. With HTTPS, **TLS** encrypts traffic between the browser and Nginx on port **443**.
+
+## Minimal config sketch (at a glance)
+
+**DNS**
+
+* `A  www.foobar.com  8.8.8.8`
+
+**Nginx (conceptual snippet)**
+
+* `server_name www.foobar.com;`
+* Listen on `443 ssl;` with your certificate and key
+* `location /assets/` → serve from disk
+* `location /` → `proxy_pass http://127.0.0.1:3000;`
+
+**Application server**
+
+* Runs from `/var/www/foobar`, listens on `127.0.0.1:3000`
+* Reads DB credentials from environment (e.g., `DATABASE_URL` or host/user/pass)
+
+**MySQL**
+
+* Bind to `127.0.0.1`
+* Use a dedicated app user with least privilege
+
+## Issues with this infrastructure (trade-offs)
+
+**Single Point of Failure (SPOF)**
+Everything lives on one machine. If the server (or its disk/network) fails, the entire site is unavailable.
+
+**Downtime for maintenance**
+Deploying new code, restarting Nginx or the app server, OS updates, or DB migrations can cause **visible downtime**—there’s no second node to keep serving traffic.
+
+**Cannot scale with heavy traffic**
+Capacity is capped by one host’s CPU/RAM/IO. Spikes can overwhelm Nginx/app/MySQL. There’s no horizontal scaling (no load balancer + extra nodes) without redesigning the architecture.
+
+—
+
+This is a clean, **one-box LEMP-style** setup (Nginx + App Server + MySQL) serving **[www.foobar.com](http://www.foobar.com)** at **8.8.8.8**, with clearly defined roles and the key limitations you should expect.
