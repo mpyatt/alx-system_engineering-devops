@@ -1,0 +1,183 @@
+# Application Server vs Web Server (and the upgraded architecture)
+
+This document explains the difference between a **web server** and an **application server**, then presents a **hardened, split-tier architecture** for `www.foobar.com` that adds high availability at the load balancer and isolates each component on its own server.
+
+---
+
+## Web server vs Application server (clear distinction)
+
+**Web server (e.g., Nginx):**
+
+* Optimized for **HTTP**.
+* Terminates **TLS/HTTPS**, handles **keep-alive**, **compression**, **caching**, and serves **static files** (images/CSS/JS).
+* Can **reverse-proxy** dynamic requests to an upstream app server.
+* Knows little to nothing about your business logic; it’s about efficient HTTP and content delivery.
+
+**Application server (e.g., Gunicorn/Uvicorn for Python, Puma/Passenger for Ruby, Node runtime, Java app server):**
+
+* Runs your **application code** (framework: Django, Rails, Express, Spring, etc.).
+* Executes **routing, controllers, business rules**, renders templates/JSON, talks to the **database** and other services.
+* Designed for **concurrency** and **long-lived processes** that execute code, not for serving static files at scale.
+
+Think of the web server as the **front-of-house** (fast HTTP doorman), and the application server as the **kitchen** (where real cooking—your logic—happens).
+
+---
+
+## Final topology (split components + HA load balancer)
+
+> We **split** the web, app, and database into **dedicated servers** and add a second load balancer (clustered) to avoid a single point of failure at the edge.
+
+### Servers (5 total)
+
+1. **LB1: HAProxy (Primary)**
+2. **LB2: HAProxy (Secondary)** — **added** to form a cluster with LB1
+3. **WEB: Nginx** (web server only)
+4. **APP: Application server** (your code only; e.g., Gunicorn on port 3000)
+5. **DB: MySQL** (database only)
+
+DNS:
+`A www.foobar.com -> VIP (virtual IP) managed by LB1/LB2`
+(When LB1 fails, LB2 advertises the VIP.)
+
+### Whiteboard sketch
+
+```sh
+User Browser
+   |
+   |  HTTPS (TCP/443)
+   v
+        [ VIP: 203.0.113.10 ]
+          |           |
+      +---+---+   +---+---+
+      | LB1   |   | LB2   |   (HAProxy cluster; VRRP keepalived)
+      +---+---+   +---+---+
+          |  (private network, health checks)
+          v
+        [ WEB ]  Nginx :80/:443 (from LBs only)
+          |
+          |  http://APP:3000  (reverse proxy)
+          v
+        [ APP ]  App server runs your code
+          |
+          |  mysql://DB:3306
+          v
+        [ DB ]   MySQL (Primary)
+```
+
+---
+
+## Why each element is added (and what it gives you)
+
+* **Second Load Balancer (LB2) + VIP (cluster)**
+  *Why:* Eliminate the **SPOF at the edge**. If LB1 dies, LB2 takes over the **virtual IP** and traffic continues.
+  *Benefit:* Higher availability; maintenance on one LB doesn’t drop the site.
+
+* **Dedicated Web server (Nginx)**
+  *Why:* Specialize HTTP termination, static delivery, caching, and reverse-proxying.
+  *Benefit:* Better performance and security posture; clean separation of duties.
+
+* **Dedicated Application server**
+  *Why:* Isolate the process that executes your **business logic** and scales independently of the web tier.
+  *Benefit:* Easier performance tuning (workers/threads), safer deploys, clearer troubleshooting.
+
+* **Dedicated Database server (MySQL)**
+  *Why:* Keep persistence isolated for performance, security (restricted ports), and backup/restore hygiene.
+  *Benefit:* Predictable I/O, simpler replication and recovery.
+
+---
+
+## How traffic flows (step-by-step)
+
+1. Browser resolves `www.foobar.com` to the **VIP**.
+2. Browser connects via **HTTPS** to the VIP → handled by **active HAProxy** (LB1 or LB2).
+3. HAProxy forwards to **Nginx (WEB)** using health-checked backends.
+4. Nginx serves **static** directly; **dynamic** requests are reverse-proxied to **APP** (e.g., `http://app:3000`).
+5. APP executes business logic, queries **MySQL (DB)**, returns response → Nginx → HAProxy → Browser.
+
+---
+
+## Load balancer cluster basics
+
+* **Clustering method:** typical approach uses **VRRP** (e.g., `keepalived`) so **one VIP** floats between LB1 and LB2.
+* **Distribution algorithm:** `roundrobin` (simple and fair). For multiple WEB nodes in the future, traffic rotates across healthy backends.
+* **Active-Passive at the edge:** Only **one** LB answers for the VIP at a time (Active). On failure, Passive becomes Active within seconds.
+
+---
+
+## Security & access (at a glance)
+
+* **Edge TLS (HTTPS)**: Certificates installed on **LBs**; optionally **re-encrypt** to WEB (LB→WEB TLS) for end-to-end encryption.
+* **Firewall rules**:
+
+  * Internet → LBs: allow 443 only.
+  * LBs → WEB: allow 80 (or 443 if re-encrypting).
+  * WEB → APP: allow 3000.
+  * APP → DB: allow 3306.
+  * SSH restricted to bastion/VPN.
+
+---
+
+## Monitoring & observability (recommended)
+
+* Install monitoring agents on **LB**, **WEB**, **APP**, and **DB**.
+* Collect:
+
+  * LB: backend health, TLS errors, 5xx, request rate.
+  * WEB: access/error logs, QPS, 4xx/5xx.
+  * APP: p95 latency, error rate, worker saturation.
+  * DB: connections, slow queries, replication lag (when replicas are added).
+* Dashboards + alerts for **uptime**, **latency**, **errors**, **resource usage**.
+
+---
+
+## Common questions
+
+**Q: Why not combine WEB and APP?**
+**A:** Separation simplifies scaling (add APP capacity without touching WEB), tightens security boundaries, and keeps HTTP concerns (TLS, caching) out of the app runtime.
+
+**Q: Can I scale later?**
+**A:** Yes. Add more **WEB** nodes and register them in HAProxy; add more **APP** nodes behind Nginx or have HAProxy point to APP directly (two-tier), and add **MySQL replicas** for read scaling/failover.
+
+---
+
+## Minimal config sketches (conceptual)
+
+**HAProxy (frontend + backend to WEB):**
+
+```haproxy
+frontend https_in
+  bind :443 ssl crt /etc/haproxy/certs/www.foobar.com.pem
+  mode http
+  option forwardfor
+  default_backend web_pool
+
+backend web_pool
+  mode http
+  balance roundrobin
+  server web1 10.0.1.20:80 check
+```
+
+**Nginx (reverse proxy to APP):**
+
+```nginx
+server {
+  listen 80;
+  server_name www.foobar.com;
+
+  location /static/ { root /var/www/foobar; }
+  location / {
+    proxy_pass http://10.0.2.30:3000;  # APP
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+}
+```
+
+---
+
+## Summary (what we added and why)
+
+* **Added one server:** a **second HAProxy** to cluster with the existing one (prevents edge SPOF).
+* **Split components onto their own servers:** **WEB**, **APP**, **DB**—each isolated for performance, security, and independent scaling.
+* **Result:** A clearer, more resilient, and maintainable architecture that cleanly distinguishes the **web server** from the **application server**, while preparing you for horizontal growth and database HA in future iterations.
