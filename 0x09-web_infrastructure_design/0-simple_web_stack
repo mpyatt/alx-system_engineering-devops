@@ -105,7 +105,3 @@ Deploying new code, restarting Nginx or the app server, OS updates, or DB migrat
 
 **Cannot scale with heavy traffic**
 Capacity is capped by one host’s CPU/RAM/IO. Spikes can overwhelm Nginx/app/MySQL. There’s no horizontal scaling (no load balancer + extra nodes) without redesigning the architecture.
-
-—
-
-This is a clean, **one-box LEMP-style** setup (Nginx + App Server + MySQL) serving **[www.foobar.com](http://www.foobar.com)** at **8.8.8.8**, with clearly defined roles and the key limitations you should expect.

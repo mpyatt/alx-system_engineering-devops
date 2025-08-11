@@ -1,0 +1,99 @@
+# User journey (request flow)
+
+1. A user types **[www.foobar.com](http://www.foobar.com)**.
+2. DNS resolves **[www.foobar.com](http://www.foobar.com) → 8.8.8.8** (the public IP of our load balancer).
+3. The browser opens **TCP 443 (HTTPS)** to **8.8.8.8**.
+4. **HAProxy** (load balancer) terminates TLS and forwards the request to the **web/app server** on the private network (e.g., `10.0.1.10:80`).
+5. **Nginx (web server)** receives the request; for dynamic routes it **reverse-proxies** to the **application server** process on the same box (e.g., `127.0.0.1:3000`).
+6. The **application server** runs your **application files (code base)** and queries **MySQL** on the dedicated **database server** (e.g., `10.0.2.20:3306`).
+7. The app returns the response → Nginx → HAProxy → user’s browser over HTTPS.
+
+## “Whiteboard” diagram (three servers)
+
+```sh
+User Browser
+    |
+    |  HTTPS (TLS) over TCP/IP
+    v
+[ Internet ]  -->  [ HAProxy LB ]  (Public IP: 8.8.8.8)
+                         |
+                         |  HTTP (backend)
+                         v
+                   [ Web/App Server ]
+                   +------------------------------+
+                   | Nginx (web server)           |
+                   |   - serves static assets     |
+                   |   - reverse-proxy → 127.0.0.1:3000
+                   | Application server           |
+                   |   - runs your code base      |
+                   +------------------------------+
+                         |
+                         |  MySQL protocol (TCP 3306)
+                         v
+                     [ Database Server ]
+                     +------------------+
+                     |   MySQL          |
+                     +------------------+
+```
+
+## Why each element exists (and what it does)
+
+* **Server (each box)**: A Linux VM/host with CPU/RAM/disk and a network interface. We use three: one for HAProxy, one for Nginx+app, one for MySQL.
+* **Domain name (foobar.com / [www.foobar.com](http://www.foobar.com))**: Human-readable name that DNS maps to an IP. We configure **`A` record** `www.foobar.com → 8.8.8.8` (the LB).
+* **HAProxy (load balancer)**: Central public entry point. Terminates TLS, spreads traffic across one or more web/app backends, health-checks them, and keeps the public IP stable during backend changes.
+* **Nginx (web server)**: Handles HTTP details (keep-alive, compression, caching), serves static files, and reverse-proxies dynamic requests to the app server.
+* **Application server**: Runs your code (routing, controllers, templates/APIs). Examples: Gunicorn/Uvicorn (Python), Puma (Ruby), Node runtime, etc.
+* **MySQL (database)**: Stores and retrieves persistent, structured data with ACID guarantees.
+
+## Load balancer specifics
+
+* **Distribution algorithm**: **roundrobin** (simple, fair rotation through available backends). If we add a second web/app server later, each request alternates between them. If a backend fails health checks, HAProxy stops sending it traffic.
+* **Active-Active vs Active-Passive**:
+
+  * **Active-Active**: multiple backends **serve traffic simultaneously** (e.g., 2 web/app servers behind HAProxy using roundrobin).
+  * **Active-Passive**: one backend serves; another sits **idle** and only takes over on failure.
+  * **Our design today** has **one** web/app backend, so effectively **not** Active-Active yet. Add a second identical web/app server and you get **Active-Active** immediately (no architecture change—just register the new backend in HAProxy).
+
+## Database Primary-Replica (how it works)
+
+*(We’re running a single MySQL server here for simplicity; this explains what you’d do next.)*
+
+* **Primary (Master)** handles **writes** and also can serve reads.
+* **Replica (Slave)** receives the Primary’s binary logs and **replays** them to stay (near) in sync—usually asynchronous replication (small **replication lag** can occur).
+* **From the application’s perspective**:
+
+  * **Primary node**: target for **INSERT/UPDATE/DELETE** (and optionally reads).
+  * **Replica node(s)**: typically used for **read-only queries** to offload traffic. Apps either use read/write splitting at the ORM/driver or via a proxy layer.
+* **Failover** (manual or automatic) promotes a Replica to Primary if the Primary fails; clients must re-point writes to the new Primary.
+
+## Networking: how the server talks to the user’s computer
+
+* Over the **TCP/IP** stack using **HTTPS (HTTP over TLS)** on **port 443** (encrypted). Internally, HAProxy talks to Nginx over HTTP; Nginx to app server over localhost; app to MySQL over TCP 3306 on the private network.
+
+## DNS configuration
+
+* `A  www.foobar.com  8.8.8.8` (points to HAProxy’s public IP).
+
+## Known issues / risks in this design
+
+* **SPOFs (Single Points of Failure)**:
+
+  * **HAProxy** is a SPOF (only one LB). If it dies, the entire site is unreachable.
+  * **Web/App** is a SPOF (only one backend). If it dies, no app traffic can be served.
+  * **MySQL** is a SPOF (only one DB). If it dies, the application can’t read/write data.
+* **Security issues**:
+
+  * If there’s **no firewall**, any port may be exposed (e.g., MySQL 3306 reachable from the internet—bad).
+  * **No HTTPS** would expose credentials/session cookies. (We’re terminating TLS at HAProxy; if that’s missing, traffic is in clear text.)
+  * Internal links should use a **private VLAN/VPC** with strict security groups (LB:443 from internet; LB→web/app:80; web/app→DB:3306; deny everything else).
+* **No monitoring/observability**:
+
+  * Without metrics/logging/alerts, failures go unnoticed. Add system metrics (CPU/RAM/disk), **HAProxy** stats, **Nginx** access/error logs, **app** logs, **MySQL** metrics (connections, slow queries, replication lag when added), and uptime checks.
+
+## Quick notes for a future hardening pass (optional, but recommended)
+
+* Add a **second web/app server** → register in HAProxy → immediate **Active-Active** app tier.
+* Add a **MySQL Replica** (or managed MySQL with Multi-AZ) → offload reads + enable faster failover.
+* Add a **second HAProxy** and a **floating IP/DNS failover** (or use a managed LB) → remove LB SPOF.
+* Enforce **HTTPS only**, HSTS, and **firewall** rules everywhere.
+* Add **monitoring + alerts** and **backups** (tested restores!).
